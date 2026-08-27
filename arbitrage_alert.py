@@ -1782,6 +1782,11 @@ def fmt_converted(value: float, decimals: int) -> str:
     precision."""
     return fmt(value, decimals)
 
+def fmt_fixed(value: float, decimals: int) -> str:
+    """Format a float to a fixed number of decimal places (no trailing-zero strip).
+    Used for paired price display so both sides always share the same decimal count."""
+    return f"{value:.{decimals}f}"
+
 def fmt(value: float, max_decimals: int = 6) -> str:
     """Format a float stripping trailing zeros, up to max_decimals places.
     Note: buy/sell prices in alerts are volume-weighted averages across
@@ -1831,14 +1836,16 @@ def send_telegram_alert(opp: Dict, pair_info: Dict):
         fill_myr = fill_usdt * usdt_myr
         profit_usdt = total_profit
         profit_myr = profit_usdt * usdt_myr
+        buy_dp = price_decimals(float(buy_price))
+        sell_dp = price_decimals(float(sell_price))
+        dp = max(buy_dp, sell_dp)
         msg = (
-            f"🚨 *USDT ARBITRAGE* 🚨\n"
-            f"🔄 Pair: {base_asset}/USDT\n"
-            f"🟢 Buy: {buy_ex.upper()} @ ${fmt_price(float(buy_price))}\n"
-            f"🔴 Sell: {sell_ex.upper()} @ ${fmt_price(float(sell_price))}\n"
-            f"💰 Profit: {fmt(float(profit_pct), 2)}% (≈ ${fmt(float(profit_usdt), 2)} / RM{fmt(float(profit_myr), 2)})\n"
-            f"📦 Fillable: {fmt(float(fill_volume))} {base_asset} (≈RM{fmt(float(fill_myr), 2)})\n"
-            f"💱 Rate: 1 USDT = RM{fmt(float(usdt_myr), 4)}\n"
+            f"🚀 *{base_asset}/USDT | {fmt(float(profit_pct), 2)}%* 🚀\n"
+            f"Direction: BUY {buy_ex.upper()} | SELL {sell_ex.upper()}\n"
+            f"Price: ${fmt_fixed(float(buy_price), dp)} | ${fmt_fixed(float(sell_price), dp)}\n"
+            f"Estimated profit: ≈ ${fmt(float(profit_usdt), 2)} / RM{fmt(float(profit_myr), 2)}\n"
+            f"Available size: {fmt(float(fill_volume))} {base_asset} (≈RM{fmt(float(fill_myr), 2)})\n"
+            f"Effective rate: RM{fmt(float(usdt_myr), 2)} | Current rate: RM{fmt(float(usdt_myr), 2)}\n"
         )
 
     elif arb_type == 'reverse':
@@ -1848,19 +1855,15 @@ def send_telegram_alert(opp: Dict, pair_info: Dict):
         sell_price_myr = Decimal(str(sell_price)) * usdt_myr
         fill_myr = fill_volume * Decimal(str(buy_price))
         profit_myr = total_profit
-        sell_decimals = price_decimals(float(sell_price))
-        rate_line = (f"💱 Effective Rate: 1 USDT = RM{fmt(float(effective_rate), 4)} "
-                     f"(CoinGecko: RM{fmt(float(usdt_myr), 4)})\n") if effective_rate else \
-                    (f"💱 Rate: 1 USDT = RM{fmt(float(usdt_myr), 4)}\n")
+        dp = price_decimals(float(buy_price))
+        eff_rate_val = float(effective_rate) if effective_rate else float(usdt_myr)
         msg = (
-            f"🚨 *REVERSE ARBITRAGE* 🚨\n"
-            f"🔄 Pair: {pair}\n"
-            f"🟢 Buy: {buy_ex.upper()} @ RM{fmt_price(float(buy_price))}\n"
-            f"🔴 Sell: {sell_ex.upper()} @ ${fmt(float(sell_price), sell_decimals)} USDT "
-            f"(RM{fmt_converted(float(sell_price_myr), sell_decimals)})\n"
-            f"💰 Profit: {fmt(float(profit_pct), 2)}% (≈ RM{fmt(float(profit_myr), 2)})\n"
-            f"📦 Fillable: {fmt(float(fill_volume))} {base_asset} (≈RM{fmt(float(fill_myr), 2)})\n"
-            f"{rate_line}"
+            f"🚀 *{pair} | {fmt(float(profit_pct), 2)}%* 🚀\n"
+            f"Direction: BUY {buy_ex.upper()} | SELL {sell_ex.upper()}\n"
+            f"Price: RM{fmt_fixed(float(buy_price), dp)} | RM{fmt_fixed(float(sell_price_myr), dp)}\n"
+            f"Estimated profit: ≈ RM{fmt(float(profit_myr), 2)}\n"
+            f"Available size: {fmt(float(fill_volume))} {base_asset} (≈RM{fmt(float(fill_myr), 2)})\n"
+            f"Effective rate: RM{fmt(eff_rate_val, 2)} | Current rate: RM{fmt(float(usdt_myr), 2)}\n"
         )
 
     elif arb_type == 'forward':
@@ -1870,32 +1873,30 @@ def send_telegram_alert(opp: Dict, pair_info: Dict):
         buy_price_usdt = Decimal(str(buy_price)) / usdt_myr
         fill_myr = fill_volume * Decimal(str(buy_price))
         profit_myr = total_profit
-        buy_decimals = price_decimals(float(buy_price_usdt))
-        rate_line = (f"💱 Effective Rate: 1 USDT = RM{fmt(float(effective_rate), 4)} "
-                     f"(CoinGecko: RM{fmt(float(usdt_myr), 4)})\n") if effective_rate else \
-                    (f"💱 Rate: 1 USDT = RM{fmt(float(usdt_myr), 4)}\n")
+        dp = price_decimals(float(buy_price))
+        dp = max(dp, price_decimals(float(sell_price)))
+        eff_rate_val = float(effective_rate) if effective_rate else float(usdt_myr)
         msg = (
-            f"🚨 *ARBITRAGE OPPORTUNITY* 🚨\n"
-            f"🔄 Pair: {pair}\n"
-            f"🟢 Buy: {buy_ex.upper()} @ ${fmt(float(buy_price_usdt), buy_decimals)} "
-            f"(RM{fmt_converted(float(buy_price), buy_decimals)})\n"
-            f"🔴 Sell: {sell_ex.upper()} @ RM{fmt_price(float(sell_price))}\n"
-            f"💰 Profit: {fmt(float(profit_pct), 2)}% (≈ RM{fmt(float(profit_myr), 2)})\n"
-            f"📦 Fillable: {fmt(float(fill_volume))} {base_asset} (≈RM{fmt(float(fill_myr), 2)})\n"
-            f"{rate_line}"
+            f"🚀 *{pair} | {fmt(float(profit_pct), 2)}%* 🚀\n"
+            f"Direction: BUY {buy_ex.upper()} | SELL {sell_ex.upper()}\n"
+            f"Price: RM{fmt_fixed(float(buy_price), dp)} | RM{fmt_fixed(float(sell_price), dp)}\n"
+            f"Estimated profit: ≈ RM{fmt(float(profit_myr), 2)}\n"
+            f"Available size: {fmt(float(fill_volume))} {base_asset} (≈RM{fmt(float(fill_myr), 2)})\n"
+            f"Effective rate: RM{fmt(eff_rate_val, 2)} | Current rate: RM{fmt(float(usdt_myr), 2)}\n"
         )
 
     else:
         # MYR-to-MYR
         fill_myr = fill_volume * Decimal(str(buy_price))
         profit_myr = total_profit
+        dp = price_decimals(float(buy_price))
+        dp = max(dp, price_decimals(float(sell_price)))
         msg = (
-            f"🚨 *ARBITRAGE OPPORTUNITY* 🚨\n"
-            f"🔄 Pair: {pair}\n"
-            f"🟢 Buy: {buy_ex.upper()} @ RM{fmt_price(float(buy_price))}\n"
-            f"🔴 Sell: {sell_ex.upper()} @ RM{fmt_price(float(sell_price))}\n"
-            f"💰 Profit: {fmt(float(profit_pct), 2)}% (≈ RM{fmt(float(profit_myr), 2)})\n"
-            f"📦 Fillable: {fmt(float(fill_volume))} {base_asset} (≈RM{fmt(float(fill_myr), 2)})\n"
+            f"🚀 *{pair} | {fmt(float(profit_pct), 2)}%* 🚀\n"
+            f"Direction: BUY {buy_ex.upper()} | SELL {sell_ex.upper()}\n"
+            f"Price: RM{fmt_fixed(float(buy_price), dp)} | RM{fmt_fixed(float(sell_price), dp)}\n"
+            f"Estimated profit: ≈ RM{fmt(float(profit_myr), 2)}\n"
+            f"Available size: {fmt(float(fill_volume))} {base_asset} (≈RM{fmt(float(fill_myr), 2)})\n"
         )
 
     payload = {
@@ -1936,11 +1937,11 @@ def send_triangle_alert(result: Dict):
     est_profit_usdt = float(result['estimated_profit_usdt'])
 
     msg = (
-        f"🔺 *TRIANGULAR ARBITRAGE* 🔺\n"
-        f"🏦 Exchange: {triangle['exchange'].upper()}\n"
-        f"🔄 Route: {direction}\n"
-        f"💰 Profit: {fmt(profit_pct, 3)}% (≈ ${fmt(est_profit_usdt, 2)})\n"
-        f"📦 Est. fillable: ${fmt(max_volume_usdt, 2)} USDT (top-of-book estimate — not full depth)\n"
+        f"🔺 *TRIANGLE | {fmt(profit_pct, 2)}%* 🔺\n"
+        f"Exchange: {triangle['exchange'].upper()}\n"
+        f"Route: {direction}\n"
+        f"Estimated profit: ≈ ${fmt(est_profit_usdt, 2)}\n"
+        f"Available size: ${fmt(max_volume_usdt, 2)} USDT (top-of-book estimate)\n"
     )
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
