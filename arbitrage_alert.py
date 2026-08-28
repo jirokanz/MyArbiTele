@@ -154,7 +154,10 @@ REFERRAL_LINKS = {
     'Binance': 'https://www.binance.com/register?ref=ZBK9WIK9',
     'Pionex': 'https://accounts.pionex.com/en/signUp?r=xYlRQCZj',
 }
-REFERRAL_INTERVAL = 600  # 10 minutes in seconds
+REFERRAL_INTERVAL = 600  # 10 minutes in seconds (kept for reference)
+REFERRAL_EVERY_N_ALERTS = 10  # fire referral message every N arb alerts
+_alert_count = 0               # global arb alert counter
+_alert_count_lock = threading.Lock()
 
 # ----------------------------------------------------------------------
 # Shared, thread-safe Telegram sender
@@ -250,18 +253,25 @@ def _enqueue_alert(payload: dict, context: str, cooldown_dict: dict, key, now: f
     was really sent (not just computed)."""
     if _enqueue_telegram(payload, context):
         cooldown_dict[key] = now
+        _increment_alert_count()
         return True
     return False
 
 
 def send_referral_message():
-    """Send the periodic registration/referral links message via Telegram."""
+    """Send the referral/signup links message via Telegram in 2-column layout."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
-    lines = ["📢 *Sign up on these exchanges:*\n"]
-    for name, link in REFERRAL_LINKS.items():
-        lines.append(f"• [{name}]({link})")
-    msg = "\n".join(lines)
+    items = list(REFERRAL_LINKS.items())
+    rows = []
+    for i in range(0, len(items), 2):
+        left_name, left_url = items[i]
+        if i + 1 < len(items):
+            right_name, right_url = items[i + 1]
+            rows.append(f"• [{left_name}]({left_url})   • [{right_name}]({right_url})")
+        else:
+            rows.append(f"• [{left_name}]({left_url})")
+    msg = "🚀 Don't just watch. Sign up and execute:\n\n" + "\n".join(rows)
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": msg,
@@ -269,6 +279,16 @@ def send_referral_message():
         "disable_web_page_preview": True,
     }
     _enqueue_telegram(payload, "Referral message")
+
+
+def _increment_alert_count():
+    """Increment arb alert counter and fire referral message every N alerts."""
+    global _alert_count
+    with _alert_count_lock:
+        _alert_count += 1
+        should_send = (_alert_count % REFERRAL_EVERY_N_ALERTS == 0)
+    if should_send:
+        send_referral_message()
 
 def sort_exchanges(exchanges: List[str]) -> List[str]:
     return sorted(exchanges, key=lambda x: EXCHANGE_ORDER.index(x) if x in EXCHANGE_ORDER else len(EXCHANGE_ORDER))
@@ -1840,12 +1860,11 @@ def send_telegram_alert(opp: Dict, pair_info: Dict):
         sell_dp = price_decimals(float(sell_price))
         dp = max(buy_dp, sell_dp)
         msg = (
-            f"🚀 *{base_asset}/USDT | {fmt(float(profit_pct), 2)}%* 🚀\n"
-            f"Direction: BUY {buy_ex.upper()} | SELL {sell_ex.upper()}\n"
-            f"Price: ${fmt_fixed(float(buy_price), dp)} | ${fmt_fixed(float(sell_price), dp)}\n"
-            f"Estimated profit: ≈ ${fmt(float(profit_usdt), 2)} / RM{fmt(float(profit_myr), 2)}\n"
-            f"Available size: {fmt(float(fill_volume))} {base_asset} (≈RM{fmt(float(fill_myr), 2)})\n"
-            f"Effective rate: RM{fmt(float(usdt_myr), 2)} | Current rate: RM{fmt(float(usdt_myr), 2)}\n"
+            f"⚡{base_asset} +{fmt_fixed(float(profit_pct), 2)}%⚡\n"
+            f"🟢 Buy  {buy_ex.upper()}  ${fmt_fixed(float(buy_price), dp)}\n"
+            f"🔴 Sell {sell_ex.upper()}  ${fmt_fixed(float(sell_price), dp)}\n"
+            f"💰 Profit ≈ ${fmt_fixed(float(profit_usdt), 2)} (≈RM{fmt_fixed(float(profit_myr), 2)})\n"
+            f"🪙 Size {fmt(float(fill_volume))} {base_asset} (≈RM{fmt_fixed(float(fill_myr), 2)})\n"
         )
 
     elif arb_type == 'reverse':
@@ -1855,15 +1874,15 @@ def send_telegram_alert(opp: Dict, pair_info: Dict):
         sell_price_myr = Decimal(str(sell_price)) * usdt_myr
         fill_myr = fill_volume * Decimal(str(buy_price))
         profit_myr = total_profit
-        dp = price_decimals(float(buy_price))
+        dp = max(price_decimals(float(buy_price)), price_decimals(float(sell_price_myr)))
         eff_rate_val = float(effective_rate) if effective_rate else float(usdt_myr)
         msg = (
-            f"🚀 *{pair} | {fmt(float(profit_pct), 2)}%* 🚀\n"
-            f"Direction: BUY {buy_ex.upper()} | SELL {sell_ex.upper()}\n"
-            f"Price: RM{fmt_fixed(float(buy_price), dp)} | RM{fmt_fixed(float(sell_price_myr), dp)}\n"
-            f"Estimated profit: ≈ RM{fmt(float(profit_myr), 2)}\n"
-            f"Available size: {fmt(float(fill_volume))} {base_asset} (≈RM{fmt(float(fill_myr), 2)})\n"
-            f"Effective rate: RM{fmt(eff_rate_val, 2)} | Current rate: RM{fmt(float(usdt_myr), 2)}\n"
+            f"⚡{base_asset} +{fmt_fixed(float(profit_pct), 2)}%⚡\n"
+            f"🟢 Buy  {buy_ex.upper()}  RM{fmt_fixed(float(buy_price), dp)}\n"
+            f"🔴 Sell {sell_ex.upper()}  RM{fmt_fixed(float(sell_price_myr), dp)}\n"
+            f"💰 Profit ≈ RM{fmt_fixed(float(profit_myr), 2)}\n"
+            f"🪙 Size {fmt(float(fill_volume))} {base_asset} (≈RM{fmt_fixed(float(fill_myr), 2)})\n"
+            f"💱 Rate RM{fmt_fixed(eff_rate_val, 2)} effective | RM{fmt_fixed(float(usdt_myr), 2)} current\n"
         )
 
     elif arb_type == 'forward':
@@ -1873,30 +1892,28 @@ def send_telegram_alert(opp: Dict, pair_info: Dict):
         buy_price_usdt = Decimal(str(buy_price)) / usdt_myr
         fill_myr = fill_volume * Decimal(str(buy_price))
         profit_myr = total_profit
-        dp = price_decimals(float(buy_price))
-        dp = max(dp, price_decimals(float(sell_price)))
+        dp = max(price_decimals(float(buy_price)), price_decimals(float(sell_price)))
         eff_rate_val = float(effective_rate) if effective_rate else float(usdt_myr)
         msg = (
-            f"🚀 *{pair} | {fmt(float(profit_pct), 2)}%* 🚀\n"
-            f"Direction: BUY {buy_ex.upper()} | SELL {sell_ex.upper()}\n"
-            f"Price: RM{fmt_fixed(float(buy_price), dp)} | RM{fmt_fixed(float(sell_price), dp)}\n"
-            f"Estimated profit: ≈ RM{fmt(float(profit_myr), 2)}\n"
-            f"Available size: {fmt(float(fill_volume))} {base_asset} (≈RM{fmt(float(fill_myr), 2)})\n"
-            f"Effective rate: RM{fmt(eff_rate_val, 2)} | Current rate: RM{fmt(float(usdt_myr), 2)}\n"
+            f"⚡{base_asset} +{fmt_fixed(float(profit_pct), 2)}%⚡\n"
+            f"🟢 Buy  {buy_ex.upper()}  RM{fmt_fixed(float(buy_price), dp)}\n"
+            f"🔴 Sell {sell_ex.upper()}  RM{fmt_fixed(float(sell_price), dp)}\n"
+            f"💰 Profit ≈ RM{fmt_fixed(float(profit_myr), 2)}\n"
+            f"🪙 Size {fmt(float(fill_volume))} {base_asset} (≈RM{fmt_fixed(float(fill_myr), 2)})\n"
+            f"💱 Rate RM{fmt_fixed(eff_rate_val, 2)} effective | RM{fmt_fixed(float(usdt_myr), 2)} current\n"
         )
 
     else:
         # MYR-to-MYR
         fill_myr = fill_volume * Decimal(str(buy_price))
         profit_myr = total_profit
-        dp = price_decimals(float(buy_price))
-        dp = max(dp, price_decimals(float(sell_price)))
+        dp = max(price_decimals(float(buy_price)), price_decimals(float(sell_price)))
         msg = (
-            f"🚀 *{pair} | {fmt(float(profit_pct), 2)}%* 🚀\n"
-            f"Direction: BUY {buy_ex.upper()} | SELL {sell_ex.upper()}\n"
-            f"Price: RM{fmt_fixed(float(buy_price), dp)} | RM{fmt_fixed(float(sell_price), dp)}\n"
-            f"Estimated profit: ≈ RM{fmt(float(profit_myr), 2)}\n"
-            f"Available size: {fmt(float(fill_volume))} {base_asset} (≈RM{fmt(float(fill_myr), 2)})\n"
+            f"⚡{base_asset} +{fmt_fixed(float(profit_pct), 2)}%⚡\n"
+            f"🟢 Buy  {buy_ex.upper()}  RM{fmt_fixed(float(buy_price), dp)}\n"
+            f"🔴 Sell {sell_ex.upper()}  RM{fmt_fixed(float(sell_price), dp)}\n"
+            f"💰 Profit ≈ RM{fmt_fixed(float(profit_myr), 2)}\n"
+            f"🪙 Size {fmt(float(fill_volume))} {base_asset} (≈RM{fmt_fixed(float(fill_myr), 2)})\n"
         )
 
     payload = {
@@ -1937,11 +1954,11 @@ def send_triangle_alert(result: Dict):
     est_profit_usdt = float(result['estimated_profit_usdt'])
 
     msg = (
-        f"🔺 *TRIANGLE | {fmt(profit_pct, 2)}%* 🔺\n"
+        f"🔄TRIANGLE +{fmt_fixed(profit_pct, 2)}%🔄\n"
         f"Exchange: {triangle['exchange'].upper()}\n"
         f"Route: {direction}\n"
-        f"Estimated profit: ≈ ${fmt(est_profit_usdt, 2)}\n"
-        f"Available size: ${fmt(max_volume_usdt, 2)} USDT (top-of-book estimate)\n"
+        f"💰 Profit ≈ ${fmt_fixed(est_profit_usdt, 2)}\n"
+        f"🪙 Size ${fmt_fixed(max_volume_usdt, 2)} USDT (est.)\n"
     )
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -2089,14 +2106,9 @@ class Reporter:
         t.start()
 
     def _start_referral_broadcaster(self):
-        """Background thread that posts the referral links every REFERRAL_INTERVAL seconds."""
-        def broadcaster():
-            logger.info(f"Starting referral link broadcaster (every {REFERRAL_INTERVAL}s)...")
-            while True:
-                time.sleep(REFERRAL_INTERVAL)
-                send_referral_message()
-        t = threading.Thread(target=broadcaster, daemon=True)
-        t.start()
+        """Referral messages now fire every REFERRAL_EVERY_N_ALERTS arb alerts
+        via _increment_alert_count() — no background thread needed."""
+        logger.info(f"Referral broadcaster: will fire every {REFERRAL_EVERY_N_ALERTS} arb alerts.")
 
     def _start_rate_updater(self):
         """Background thread to fetch USDT/MYR every 60 seconds."""
