@@ -1406,14 +1406,20 @@ def calculate_max_fillable(buy_asks, sell_bids, buy_fee_rate: Decimal, sell_fee_
 def compute_profit(buy_avg: Decimal, sell_avg: Decimal, fee_buy: Decimal, fee_sell: Decimal) -> Tuple[Decimal, Decimal, Decimal]:
     """Shared fee-inclusive profit math used by every arbitrage branch.
 
-    Returns (cost, profit_per_unit, profit_pct) where cost is the fee-inclusive
-    buy price and profit_pct is net-of-fees profit relative to cost.
+    buy_avg and sell_avg come from calculate_max_fillable / _fill_orderbooks,
+    which already bakes fees in during the level walk:
+        step_buy  = ask_price * (1 + buy_fee)
+        step_sell = bid_price * (1 - sell_fee)
+    So buy_avg and sell_avg are already fee-inclusive averages — do NOT
+    multiply by fees again here (that was causing double-fee and suppressing
+    real opportunities below min_profit_pct).
+
+    Returns (buy_avg, profit_per_unit, profit_pct) — first element kept for
+    backward compatibility with callers that unpack three values.
     """
-    cost = buy_avg * (1 + fee_buy)
-    revenue = sell_avg * (1 - fee_sell)
-    profit_per_unit = revenue - cost
-    profit_pct = (profit_per_unit / cost) * 100 if cost > 0 else Decimal('0')
-    return cost, profit_per_unit, profit_pct
+    profit_per_unit = sell_avg - buy_avg
+    profit_pct = (profit_per_unit / buy_avg) * 100 if buy_avg > 0 else Decimal('0')
+    return buy_avg, profit_per_unit, profit_pct
 
 def calculate_triangle_opportunity(cache: 'PriceDepthCache', triangle: Dict, fee: Decimal,
                                     min_profit_pct: Decimal) -> Optional[Dict]:
@@ -1536,7 +1542,7 @@ def calculate_opportunities(prices: Dict, min_profit_pct: Decimal) -> List[Dict]
                         buy_asks, sell_bids, fee_buy, fee_sell, min_profit_pct)
                     if max_volume <= 0:
                         continue
-                    cost, profit_per_unit, profit_pct = compute_profit(buy_avg, sell_avg, fee_buy, fee_sell)
+                    _, profit_per_unit, profit_pct = compute_profit(buy_avg, sell_avg, fee_buy, fee_sell)
                     if profit_pct < min_profit_pct:
                         continue
                     if max_volume * buy_avg * usdt_myr < Decimal('10'):
@@ -1573,10 +1579,10 @@ def calculate_opportunities(prices: Dict, min_profit_pct: Decimal) -> List[Dict]
                         buy_asks, sell_bids_myr, fee_buy, fee_sell, min_profit_pct)
                     if max_volume <= 0:
                         continue
-                    cost_myr, profit_per_unit, profit_pct = compute_profit(buy_avg, sell_avg_myr, fee_buy, fee_sell)
+                    _, profit_per_unit, profit_pct = compute_profit(buy_avg, sell_avg_myr, fee_buy, fee_sell)
                     if profit_pct < min_profit_pct:
                         continue
-                    if max_volume * cost_myr < Decimal('10'):
+                    if max_volume * buy_avg < Decimal('10'):
                         continue
                     sell_avg_usdt = sell_avg_myr / usdt_myr
                     # Both buy_avg (native MYR ask, buy exchange) and
@@ -1616,7 +1622,7 @@ def calculate_opportunities(prices: Dict, min_profit_pct: Decimal) -> List[Dict]
                         buy_asks_myr, sell_bids_myr, fee_buy, fee_sell, min_profit_pct)
                     if max_volume <= 0:
                         continue
-                    cost, profit_per_unit, profit_pct = compute_profit(buy_avg, sell_avg, fee_buy, fee_sell)
+                    _, profit_per_unit, profit_pct = compute_profit(buy_avg, sell_avg, fee_buy, fee_sell)
                     if profit_pct < min_profit_pct:
                         continue
                     if max_volume * buy_avg < Decimal('10'):
@@ -1659,7 +1665,7 @@ def calculate_opportunities(prices: Dict, min_profit_pct: Decimal) -> List[Dict]
                     buy_asks, sell_bids, fee_buy, fee_sell, min_profit_pct)
                 if max_volume <= 0:
                     continue
-                cost, profit_per_unit, profit_pct = compute_profit(buy_avg, sell_avg, fee_buy, fee_sell)
+                _, profit_per_unit, profit_pct = compute_profit(buy_avg, sell_avg, fee_buy, fee_sell)
                 if profit_pct < min_profit_pct:
                     continue
                 if max_volume * buy_avg < Decimal('10'):
@@ -1948,28 +1954,14 @@ class Reporter:
         self._start_keypress_listener()
 
     def _on_price_update(self, exchange: str, symbol: str):
-        """Fired the instant any exchange's cached depth changes (WS push or
-        REST poll). Recomputes just this one pair and alerts immediately,
-        instead of waiting for the next periodic scan. Reads cache-only
-        (use_rest_fallback=False) so this never blocks a WS thread on a
-        network call — the periodic monitor() loop still covers filling
-        any gaps every _FETCH_SCAN_INTERVAL (10 minutes)."""
-        pair_info = self._symbol_to_pair.get((exchange, symbol))
-        if pair_info:
-            usdt_myr = self.cache.get_usdt_myr()
-            prices = self.get_prices(pair_info, usdt_myr=usdt_myr, use_rest_fallback=False)
-            if prices:
-                opportunities = calculate_opportunities(prices, MIN_PROFIT_PCT)
-                for opp in opportunities:
-                    if not should_alert(opp):
-                        continue
-                    send_telegram_alert(opp, pair_info)
-
-        for tri in self._symbol_to_triangles.get((exchange, symbol), []):
-            fee = TAKER_FEES.get(exchange, Decimal('0.001'))
-            result = calculate_triangle_opportunity(self.cache, tri, fee, MIN_PROFIT_PCT)
-            if result:
-                send_triangle_alert(result)
+        """Fired the instant any exchange's cached depth changes (WS push).
+        No-op for alerting — alerts are sent exclusively by the monitor()
+        scan loop every _FETCH_SCAN_INTERVAL (10 minutes). Keeping this
+        callback avoids the cooldown-refresh problem: if _on_price_update
+        sent alerts it would continuously reset the cooldown timestamp on
+        every WS tick, preventing monitor() from ever firing a repeat alert
+        after exactly 10 minutes."""
+        pass
 
     def _start_telegram_sender(self):
         """Single dedicated thread that drains the Telegram send queue."""
