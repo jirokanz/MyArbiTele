@@ -251,11 +251,25 @@ def _enqueue_alert(payload: dict, context: str, cooldown_dict: dict, key, now: f
     """_enqueue_telegram, plus starting the cooldown for this key once the
     alert is actually queued for delivery — shared by send_telegram_alert
     and send_triangle_alert so both cooldown dicts stay in sync with what
-    was really sent (not just computed)."""
-    if _enqueue_telegram(payload, context):
+    was really sent (not just computed).
+
+    The cooldown write is done under _cooldown_lock *before* enqueueing so
+    that a concurrent caller (e.g. _on_price_update WS thread racing with
+    monitor()) that reads the dict between our check and our write cannot
+    slip through and send a duplicate."""
+    with _cooldown_lock:
+        # Re-check under the lock — another thread may have written the key
+        # between our caller's check and now.
+        if now - cooldown_dict.get(key, 0) < ALERT_COOLDOWN:
+            return False
         cooldown_dict[key] = now
+    if _enqueue_telegram(payload, context):
         _increment_alert_count()
         return True
+    # Enqueue failed (queue full) — clear the timestamp so the next attempt
+    # isn't silently suppressed by a cooldown that never actually sent.
+    with _cooldown_lock:
+        cooldown_dict.pop(key, None)
     return False
 
 
@@ -1673,6 +1687,9 @@ _last_sent_time = {}
 ALERT_COOLDOWN = 600  # 10 minutes in seconds
 _last_prune_time = [0.0]
 PRUNE_INTERVAL = 3600  # sweep stale cooldown keys at most once an hour
+# Single lock shared by all cooldown dicts so the check-and-set is atomic
+# across concurrent callers (_on_price_update WS thread vs monitor() thread).
+_cooldown_lock = threading.Lock()
 
 def _prune_cooldown_dict(d: dict, now: float, last_prune_holder: list, cooldown: float):
     """Drop cooldown entries that expired long ago from any (key -> timestamp)
