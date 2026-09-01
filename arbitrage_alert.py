@@ -3,14 +3,15 @@
 STANDALONE LIVE ARBITRAGE REPORTER
 - Exchange order: Binance → Pionex → Luno → Hata → Sinegy → KDX → MX
 - Public WebSocket for Binance, Pionex, Luno, Hata, Sinegy
-- REST poll for KDX and MX (Sinegy has REST fallback)
+- REST fetch for KDX and MX (Sinegy has REST fallback)
 - No API keys required for market data
 - Reads TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID from api.txt
 - Duplicate prevention: time-based cooldown (10 minutes) per (pair, buy_exchange, sell_exchange)
 - Shows REAL fillable volume from order books
 - USDT/MYR rate fetched once every 60s in background, shared across all pairs
-- Binance/Luno/Hata/Sinegy REST fallbacks poll on-demand (cache miss only)
-- KDX and MX have no WS; they're background-polled on a fixed 60-second interval
+- Binance/Luno/Hata/Sinegy REST fallbacks used on-demand (cache miss only)
+- KDX and MX have no WS; fetched fresh via _fetch_all_depths() at the start of
+  each 10-minute monitor() scan cycle (no background poller)
 """
 
 import os
@@ -1069,94 +1070,6 @@ class SinegyPublicWSManager:
 # ----------------------------------------------------------------------
 # Pollers for KDX and MX (REST only) – fixed 60-second interval
 # ----------------------------------------------------------------------
-class RestDepthPoller:
-    """Shared threading/loop scaffolding for REST-only exchanges with no WS
-    feed (KDX, MX). Subclasses only need to implement _fetch_orderbook(pair)
-    to hit their own endpoint and call self.cache.update_depth(...).
-
-    Loop shape: poll every pair once (1s apart, so as not to burst the
-    exchange), then sleep `interval` before starting the next full sweep.
-    """
-    EXCHANGE = None  # set by subclass, used only for logging
-
-    def __init__(self, pairs: List[str], cache: PriceDepthCache, interval: float = 60.0):
-        self.pairs = pairs
-        self.cache = cache
-        self.interval = interval
-        self._running = False
-        self._thread = None
-
-    def _fetch_orderbook(self, pair: str):
-        raise NotImplementedError
-
-    def _run(self):
-        while self._running:
-            for pair in self.pairs:
-                if not self._running:
-                    break
-                self._fetch_orderbook(pair)
-                time.sleep(1.0)
-            time.sleep(self.interval)
-
-    def start(self):
-        if not self.pairs:
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=2)
-
-
-class KDXDepthPoller(RestDepthPoller):
-    EXCHANGE = 'kdx'
-
-    def _fetch_orderbook(self, pair: str):
-        base = pair[:-3]
-        market = f"MYR-{base}"
-        try:
-            resp = requests.get(
-                "https://api.kdx.com.my/public/v1/market/orderbook",
-                params={"market": market},
-                timeout=5
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                book = data.get('data', {})
-                bids_raw = book.get('buy', [])
-                asks_raw = book.get('sell', [])
-                if bids_raw and asks_raw:
-                    bids = [(Decimal(str(b['rate'])), Decimal(str(b['quantity']))) for b in bids_raw[:10]]
-                    asks = [(Decimal(str(a['rate'])), Decimal(str(a['quantity']))) for a in asks_raw[:10]]
-                    if bids and asks:
-                        self.cache.update_depth('kdx', pair, bids, asks)
-        except Exception:
-            pass
-
-
-class MXDepthPoller(RestDepthPoller):
-    EXCHANGE = 'mx'
-
-    def _fetch_orderbook(self, pair: str):
-        try:
-            resp = requests.get(
-                "https://openapi.mx.exchange/api/1/orderbooks",
-                params={"pair": pair},
-                timeout=5
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                bids = data.get('bids', [])
-                asks = data.get('asks', [])
-                if bids and asks:
-                    bid_depth = [(Decimal(str(b['price'])), Decimal(str(b.get('volume', b.get('amount', 0))))) for b in bids]
-                    ask_depth = [(Decimal(str(a['price'])), Decimal(str(a.get('volume', a.get('amount', 0))))) for a in asks]
-                    self.cache.update_depth('mx', pair, bid_depth, ask_depth)
-        except Exception:
-            pass
 
 # ----------------------------------------------------------------------
 # Market discovery (with retry for MX, fixed Pionex, correct Sinegy)
@@ -2011,8 +1924,6 @@ class Reporter:
         self.luno_ws = None
         self.hata_ws = None
         self.sinegy_ws = None
-        self.kdx_poller = None
-        self.mx_poller = None
         self._start_websockets()
         self._start_rate_updater()
         self._start_referral_broadcaster()
@@ -2025,7 +1936,7 @@ class Reporter:
         instead of waiting for the next periodic scan. Reads cache-only
         (use_rest_fallback=False) so this never blocks a WS thread on a
         network call — the periodic monitor() loop still covers filling
-        any gaps every SCAN_INTERVAL."""
+        any gaps every _FETCH_SCAN_INTERVAL (10 minutes)."""
         pair_info = self._symbol_to_pair.get((exchange, symbol))
         if pair_info:
             usdt_myr = self.cache.get_usdt_myr()
@@ -2196,23 +2107,8 @@ class Reporter:
         else:
             logger.info("Sinegy WS: no pairs or WS not available")
 
-        # KDX poller – 60-second interval
-        kdx_pairs = [p['kdx'] for p in self.pairs if 'kdx' in p]
-        if kdx_pairs:
-            self.kdx_poller = KDXDepthPoller(kdx_pairs, self.cache, interval=60.0)
-            self.kdx_poller.start()
-            logger.info(f"KDX poller started for {len(kdx_pairs)} pairs (1s between pairs, {self.kdx_poller.interval:.0f}s interval)")
-        else:
-            logger.info("KDX poller: no pairs")
-
-        # MX poller – 60-second interval
-        mx_pairs = [p['mx'] for p in self.pairs if 'mx' in p]
-        if mx_pairs:
-            self.mx_poller = MXDepthPoller(mx_pairs, self.cache, interval=60.0)
-            self.mx_poller.start()
-            logger.info(f"MX poller started for {len(mx_pairs)} pairs (1s between pairs, {self.mx_poller.interval:.0f}s interval)")
-        else:
-            logger.info("MX poller: no pairs")
+        # KDX and MX have no WS — depth is fetched in _fetch_all_depths() at
+        # the start of every monitor() scan cycle instead of a background poller.
 
     def stop(self):
         if self.binance_ws: self.binance_ws.stop()
@@ -2220,8 +2116,6 @@ class Reporter:
         if self.luno_ws: self.luno_ws.stop()
         if self.hata_ws: self.hata_ws.stop()
         if self.sinegy_ws: self.sinegy_ws.stop()
-        if self.kdx_poller: self.kdx_poller.stop()
-        if self.mx_poller: self.mx_poller.stop()
 
     def get_prices(self, pair_info: Dict, usdt_myr: Optional[float] = None, use_rest_fallback: bool = True) -> Optional[Dict]:
         prices = {}
@@ -2277,14 +2171,60 @@ class Reporter:
             return ordered
         return None
 
+    _FETCH_SCAN_INTERVAL = 600.0  # 10 minutes: fetch fresh depth + full scan
+
+    def _fetch_all_depths(self):
+        """
+        Proactively fetch orderbook depth for REST-only exchanges (KDX, MX)
+        in parallel, writing results into self.cache.
+
+        WS exchanges (Binance, Pionex, Luno, Hata, Sinegy) stay live via
+        their background managers and are not touched here.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        fetch_map = {
+            'kdx': rest_fetch_kdx_ticker,
+            'mx':  rest_fetch_mx_orderbook,
+        }
+
+        tasks = []
+        for pair in self.pairs:
+            for ex, fetch_fn in fetch_map.items():
+                sym = pair.get(ex)
+                if sym:
+                    tasks.append((ex, sym, fetch_fn))
+
+        if not tasks:
+            return
+
+        def _fetch(ex, sym, fn):
+            try:
+                raw = fn(sym)
+                if raw and raw.get('bids') and raw.get('asks'):
+                    self.cache.update_depth(ex, sym, raw['bids'], raw['asks'])
+            except Exception as e:
+                logger.debug(f"_fetch_all_depths {ex}/{sym}: {e}")
+
+        with ThreadPoolExecutor(max_workers=len(tasks), thread_name_prefix='depth-fetch') as pool:
+            futs = [pool.submit(_fetch, ex_name, sym, fn) for ex_name, sym, fn in tasks]
+            for f in as_completed(futs):
+                pass
+
     def monitor(self):
-        SCAN_INTERVAL = 3  # seconds between full scans
-        logger.info(f"Starting monitor loop ({SCAN_INTERVAL}s interval)...")
+        logger.info(f"Starting monitor loop ({self._FETCH_SCAN_INTERVAL:.0f}s fetch+scan interval)...")
         try:
             while True:
-                # Snapshot the rate once per scan so every pair in the same
-                # loop iteration uses an identical USDT/MYR value.
+                t0 = time.time()
+
+                # 1. Fetch REST-only depths (KDX, MX) in parallel
+                self._fetch_all_depths()
+
+                # 2. Snapshot USDT/MYR once so every pair in this scan uses
+                #    an identical rate.
                 loop_usdt_myr = self.cache.get_usdt_myr()
+
+                # 3. Scan all pairs and triangles with fresh data
                 for pair in self.pairs:
                     prices = self.get_prices(pair, usdt_myr=loop_usdt_myr)
                     if not prices:
@@ -2294,12 +2234,18 @@ class Reporter:
                         if not should_alert(opp):
                             continue
                         send_telegram_alert(opp, pair)
+
                 for tri in self.triangles:
                     fee = TAKER_FEES.get(tri['exchange'], Decimal('0.001'))
                     result = calculate_triangle_opportunity(self.cache, tri, fee, MIN_PROFIT_PCT)
                     if result:
                         send_triangle_alert(result)
-                time.sleep(SCAN_INTERVAL)
+
+                # 4. Sleep remainder of the 10-minute interval
+                elapsed = time.time() - t0
+                sleep_for = max(0.0, self._FETCH_SCAN_INTERVAL - elapsed)
+                time.sleep(sleep_for)
+
         except KeyboardInterrupt:
             logger.info("Monitor stopped by user.")
         finally:
