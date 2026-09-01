@@ -1690,7 +1690,10 @@ def calculate_opportunities(prices: Dict, min_profit_pct: Decimal) -> List[Dict]
 # ----------------------------------------------------------------------
 # Time‑based deduplication: store last send timestamp for each (pair, buy_exchange, sell_exchange)
 _last_sent_time = {}
-ALERT_COOLDOWN = 600  # 10 minutes in seconds
+ALERT_COOLDOWN = 590  # 10 minutes minus 10s headroom — ensures the cooldown always
+                      # expires before the next monitor() scan arrives (fetch + scan
+                      # overhead means the scan's "now" is typically 595–599s after
+                      # the previous one, which would fail a strict 600s check).
 _last_prune_time = [0.0]
 PRUNE_INTERVAL = 3600  # sweep stale cooldown keys at most once an hour
 # Single lock shared by all cooldown dicts so the check-and-set is atomic
